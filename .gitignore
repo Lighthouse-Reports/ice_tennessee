@@ -1,7 +1,3 @@
-data/input/*
-data/results/*
-data/intermediate/*
-
 # pyenv
 .python-version
 

@@ -1,0 +1,246 @@
+---
+title: "DPD preprocessing"
+author: "Justin Braun"
+date: "2025-10-28"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Load libraries
+```{r}
+library(dplyr)
+library(tidyr)
+library(lubridate)
+library(readxl)
+library(data.table)
+library(arrow)
+```
+
+## Global variables
+```{r}
+INPUT_FP <- '../../../data/input/DPD/'
+OUTPUT_FP <- '../../../data/intermediate/DPD/'
+
+dir.create(OUTPUT_FP, showWarnings = F)
+
+# define raw data filenames
+arrest_file <- 'Oct 2025 ERO Admin Arrests_LESA-STU-FINAL Release_raw.xlsx' #Oct 25
+detainer_file <- 'Oct 2025 ERO Detainers_LESA-STU_FINAL Release_raw.xlsx' #Oct 25
+encounters_file <- '2025-ICLI-00019_2024-ICFO-39357_ERO Encounters_LESA-STU_FINAL Redacted_raw.xlsx' # Jul 25
+detentions_file <- 'Oct 2025 ICE Detentions_LESA-STU_FINAL Release_raw.xlsx' #Oct 25
+removals_file <- '2025-ICLI-00019_2024-ICFO-39357_ICE Removals_LESA-STU_FINAL Redacted_raw.xlsx'
+```
+
+
+## Define variable types
+codebook ice data contains variable type descriptions for each variable in all datasets.
+```{r}
+# arrests
+arrests_cb <- read_excel(paste0(INPUT_FP, 'codebook ice data.xlsx'), sheet = 'arrests')
+arrests_col_types <- arrests_cb$data_format
+
+# detainers
+detainers_cb <- read_excel(paste0(INPUT_FP, 'codebook ice data.xlsx'), sheet = 'detainers')
+detainers_col_types <- detainers_cb$data_format
+
+# encounters
+encounters_cb <- read_excel(paste0(INPUT_FP, 'codebook ice data.xlsx'), sheet = 'encounters')
+encounters_col_types <- encounters_cb$data_format
+
+# detentions
+detentions_cb <- read_excel(paste0(INPUT_FP, 'codebook ice data.xlsx'), sheet = 'detentions')
+detentions_col_types <- detentions_cb$data_format
+
+# removals
+removals_cb <- read_excel(paste0(INPUT_FP, 'codebook ice data.xlsx'), sheet = 'removals')
+removals_col_types <- removals_cb$data_format
+```
+
+
+
+## Load data
+```{r}
+arrests <- suppressWarnings(read_xlsx(paste0(INPUT_FP, arrest_file),
+                     sheet = 1,
+                     col_types = arrests_col_types,
+                     skip = 6)) %>%
+  janitor::clean_names(allow_dupes = FALSE) %>%
+  rename_with(~ paste0('arrests_', .x))
+
+
+
+detainers <- suppressWarnings(read_xlsx(paste0(INPUT_FP, detainer_file),
+                       sheet = 1,
+                       col_types = detainers_col_types,
+                       skip = 6)) %>%
+  janitor::clean_names(allow_dupes = FALSE) %>%
+  rename_with(~ paste0('detainers_', .x))
+
+encounters <- readxl::excel_sheets(paste0(INPUT_FP, encounters_file)) %>% 
+  set_names() %>%
+  map_dfr(
+  ~ suppressWarnings(readxl::read_excel(
+    path = paste0(INPUT_FP, encounters_file),
+    sheet = .x,
+    col_types = encounters_col_types,
+    skip = 6
+  )),
+  .id = "sheet_original"
+) %>%
+  janitor::clean_names(allow_dupes = FALSE) %>%
+  rename_with(~ paste0('encounters_', .x))
+
+detentions <-
+  readxl::excel_sheets(path = paste0(INPUT_FP, detentions_file)) %>%
+  set_names() %>%
+  map_dfr(
+    ~ suppressWarnings(readxl::read_excel(path = paste0(INPUT_FP, detentions_file), 
+                         sheet = .x, 
+                         col_types = detentions_col_types, 
+                         skip = 6)),
+    .id = "sheet"
+  ) %>%
+  janitor::clean_names(allow_dupes = FALSE) %>%
+  rename_with(~ paste0('detentions_', .x))
+
+removals <- suppressWarnings(readxl::read_excel(path = paste0(INPUT_FP, removals_file), 
+                                  sheet = 1, col_types = removals_col_types, skip = 6)) %>%
+  janitor::clean_names(allow_dupes = FALSE) %>%
+  rename_with(~ paste0('removals_', .x))
+```
+
+
+## Duplicate removal
+DPD's duplicate-removal scripts identify potential duplicates but don't clearly link them to each other, making it non-obvious which observations need to be removed. In additon, there are some trade-offs with DPD's duplicate removal approach: usually observations are not perfect duplicates, i.e., they differ on some characteristics even though they both have the same unique ID and time-stamp. This means we have to strike a balance as to how many fields have to match to define a duplicate. I will make explicit below the fields I match on for each dataset.
+
+### Arrests
+We are removing observations, where the unique ID was arrested more than 24 hours previously. Looking through these duplicates, many clearly seem to refer to the same arrest event but have different agencies/programs involved. My best guess is that sometimes officers from different programs are involved in an arrest with several officers entering the arrest in the database, leading to these duplicates. 
+It is possible that some agencies are quicker than others at entering arrests into the database. So if we want to be sticklers, we may want to check the robustness of our findings by instead using the last entered arrest. But given that this only 1.7% of cases in our database are affected, I am not too worried.
+```{r}
+arrests_dd <- arrests %>%
+  arrange(arrests_unique_identifier, arrests_apprehension_date) %>%
+  group_by(arrests_unique_identifier) %>%
+  mutate(previous_arrest_time = lag(arrests_apprehension_date)) %>%
+  ungroup() %>%
+  mutate(time_since_last_arrest = as.numeric(arrests_apprehension_date - previous_arrest_time, units = 'hours'),
+         potential_dupe = case_when((time_since_last_arrest >= 0 & time_since_last_arrest < 24) ~ 1,
+                                    TRUE ~ 0)) %>%
+  filter(potential_dupe != 1)
+```
+### Detainers
+For detainers, DPD marks any observation that has same ID and date as a potential duplicate. I am a bit more restrictive since it seems plausible that a new detainer may be issued for the same person if another detainer has been lifted because it was incorrectly prepared or refused by the jail for some other reason.
+```{r}
+set.seed(42)
+
+detainers_dd <- detainers %>%
+  group_by(detainers_detainer_prepare_date, detainers_unique_identifier, detainers_detainer_lift_reason) %>%
+  # I don't have strong reasons to sort observations so I will just keep a random one
+  slice_sample(n = 1) 
+```
+
+### Encounters
+I think the logic here is similar to arrests. But I want to retain the rows that have more information relevant to us, which means we'll keep rows that have non-NA landmarks.
+```{r}
+encounters_dd <- encounters %>%
+  group_by(encounters_unique_identifier, encounters_event_date) %>%
+  slice(if (any(!is.na(encounters_event_landmark))) which(!is.na(encounters_event_landmark))[1] else 1) 
+```
+
+### Detentions
+July DPD's script does not remove duplicates from detentions. I remove duplicates where time stamps for book in/book out of detention spells match exactly.
+UPDATE: October DPD script removes duplicates by keeping stint with lowest bond amount. They don't give a reason for this and I don't see one either, so I will stick with random selection.
+```{r}
+detentions_dd <- detentions %>%
+  group_by(detentions_unique_identifier, detentions_book_in_date_time, detentions_detention_facility_code) %>%
+  # I don't have strong reasons to sort observations so I will just keep a random one
+  slice_sample(n = 1)
+```
+
+### Removals
+Just adapting this from DPD.
+```{r}
+removals_dd <- removals %>%
+  group_by(removals_departed_date, removals_unique_identifier) %>%
+  slice_sample(n = 1)
+```
+
+## Additional data cleaning
+### Remove empty cols
+```{r}
+# arrests
+arrests_dd <- arrests_dd %>%
+  dplyr::select(where(~ !(all(is.na(.x)) || dplyr::n_distinct(na.omit(.x)) <= 1)))
+
+# detainers
+detainers_dd <- detainers_dd %>%
+  dplyr::select(where(~ !(all(is.na(.x)) || dplyr::n_distinct(na.omit(.x)) <= 1)))
+
+# detentions
+detentions_dd <- detentions_dd %>%
+  dplyr::select(where(~ !(all(is.na(.x)) || dplyr::n_distinct(na.omit(.x)) <= 1)))
+
+# encounters
+encounters_dd <- encounters_dd %>%
+  dplyr::select(where(~ !(all(is.na(.x)) || dplyr::n_distinct(na.omit(.x)) <= 1)))
+
+# removals
+removals_dd <- removals_dd %>%
+  dplyr::select(where(~ !(all(is.na(.x)) || dplyr::n_distinct(na.omit(.x)) <= 1)))
+```
+
+
+## Derived additional variabls
+
+```{r}
+arrests_clean <- arrests_dd %>%
+  mutate(arrests_apprehension_is_287 = grepl('287', arrests_apprehension_method),
+         arrests_apprehension_month = floor_date(arrests_apprehension_date, 'month'),
+         arrests_after_Trump = ifelse(arrests_apprehension_date > as.Date('2025-01-20'), 1, 0))
+
+encounters_clean <- encounters_dd %>%
+  mutate(encounter_is_287 =  grepl('287', encounters_event_type),
+         encounters_event_month = floor_date(encounters_event_date, 'month'),
+         encounters_after_Trump = ifelse(encounters_event_date > as.Date('2025-01-20'), 1, 0))
+
+detainers_clean <- detainers_dd %>%
+  mutate(detainer_is_287 = grepl('287', detainers_final_program),
+         detainers_prepare_month = floor_date(detainers_detainer_prepare_date, 'month'),
+         detainers_after_Trump = ifelse(detainers_detainer_prepare_date > as.Date('2025-01-20'), 1, 0))
+
+detentions_clean <- detentions_dd %>%
+  mutate(detention_is_287 = grepl('287', detentions_final_program),
+         detention_book_in_month = floor_date(detentions_stay_book_in_date_time, 'month'),
+         detentions_after_Trump = ifelse(detentions_stay_book_in_date_time > as.Date('2025-01-20'), 1, 0))
+
+removals_clean <- removals_dd %>%
+  mutate(removals_departed_month = floor_date(removals_departed_date, 'month'),
+         removals_after_Trump = ifelse(removals_departed_date > as.Date('2025-01-20'), 1, 0))
+```
+
+
+## Derived dataset generation
+Note that October DPD does something similar but includes information on first, last and longest stint in the stay-level dataset. I only include first here. We can adapt this later if needed.
+```{r}
+# Detentions short only has the first detention spell of any detention stay. This allows us a) to track which ICE facility detainees are brought to first and b) treat the Detentions dataset as "stay" rather than spell level, which is more analogous to the other datasets in the release.
+detentions_short <- detentions_clean %>%
+  filter(difftime(detentions_stay_book_in_date_time, detentions_book_in_date_time, units = 'mins') == 0)
+```
+
+
+## Save files
+```{r}
+#CHECK add date stamp
+july_ts <- '2507_'
+oct_ts <- '2510_'
+write_feather(arrests_clean, paste0(OUTPUT_FP, oct_ts, 'arrests.feather'))
+write_feather(encounters_clean, paste0(OUTPUT_FP, july_ts, 'encounters.feather'))
+write_feather(detainers_clean, paste0(OUTPUT_FP, oct_ts, 'detainers.feather'))
+write_feather(detentions_clean, paste0(OUTPUT_FP, oct_ts, 'detentions.feather'))
+write_feather(detentions_short, paste0(OUTPUT_FP, oct_ts, 'detentions_short.feather'))
+write_feather(removals_clean, paste0(OUTPUT_FP, july_ts, 'removals.feather'))
+```
+
+

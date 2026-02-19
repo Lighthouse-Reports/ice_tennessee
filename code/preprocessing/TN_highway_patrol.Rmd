@@ -31,10 +31,6 @@ INTERMEDIARY_FP <- '../../data/intermediate/TN Highway Patrol/'
 ## Load data
 ```{r}
 pr <- read.csv(paste0(INPUT_FP, 'pinpoint_ocr_v4.csv'))
-page_numbers <- read_xlsx(paste0(INPUT_FP, 'HP_page_numbers.xlsx')) %>%
-  rename(start_page = Start,
-         end_page = End)%>% 
-  mutate(EVENT = as.character(EVENT))
 ```
 
 
