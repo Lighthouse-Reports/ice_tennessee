@@ -1,0 +1,676 @@
+---
+title: "DPD_TN"
+author: "Justin Braun"
+date: "2025-10-30"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Load libraries
+```{r}
+library(dplyr)
+library(tidyr)
+library(lubridate)
+library(arrow)
+library(ggplot2)
+library(zoo)
+library(rio)
+library(maps)
+library(gganimate)
+library(gifski)
+library(ggrepel)
+library(sf)
+```
+
+## Set up global variables
+```{r}
+INPUT_FP <- '../../../data/intermediate/DPD/'
+OUTPUT_FP <- '../../../data/results/DPD/tn/'
+
+dir.create(OUTPUT_FP, showWarnings = F)
+LAST_DATE <- as.Date('2025-07-29')
+
+OP_START <- '2025-05-01' # operation start date
+OP_END <- '2025-05-14' # operation end date
+```
+
+
+## Load data
+
+### Main DPD data
+```{r}
+arrests_jul <- read_feather(paste0(INPUT_FP, '2507_arrests.feather'))
+arrests_oct <- read_feather(paste0(INPUT_FP, '2510_arrests.feather'))
+detainers_jul <- read_feather(paste0(INPUT_FP, '2507_detainers.feather'))
+detainers_oct <- read_feather(paste0(INPUT_FP, '2510_detainers.feather'))
+encounters_jul <- read_feather(paste0(INPUT_FP, '2507_encounters.feather'))
+detentions_jul <- read_feather(paste0(INPUT_FP, '2507_detentions.feather'))
+detentions_short_jul <- read_feather(paste0(INPUT_FP, '2507_detentions_short.feather'))
+detentions_oct <- read_feather(paste0(INPUT_FP, '2510_detentions.feather'))
+detentions_short_oct <- read_feather(paste0(INPUT_FP, '2510_detentions_short.feather'))
+removals_jul <- read_feather(paste0(INPUT_FP, '2507_removals.feather'))
+```
+
+### additional datasets
+```{r}
+facilities <- read.csv('../../../data/input/ICE facilities/facilities.csv')
+
+# TN highway patrol reports
+pr_short <- read.csv('../../../data/intermediate/TN Highway Patrol/pr_short.csv') 
+pr_short_geo <- pr_short %>%
+  filter(!is.na(long), !is.na(lat)) %>%
+  st_as_sf(coords = c("long", "lat"), crs = 4326)
+pr_long <- read.csv('../../../data/intermediate/TN Highway Patrol/pr_long_events.csv')
+
+# OSINT Maps
+OSINT_social <- import('../../../data/intermediate/OSINT Maps/Nashville Visual Media Tracking.xlsx', sheet = 'Visuals Tracking')
+OSINT_bodycam <- import('../../../data/intermediate/OSINT Maps/Nashville Visual Media Tracking.xlsx', sheet = 'BodycamDashcam Videos')
+```
+
+
+## Arrests in TN
+```{r}
+# arrests in TN
+arrests_tn <- arrests_oct %>%
+  filter(arrests_apprehension_state == 'TENNESSEE')
+
+# moving average of daily arrests with k = 10
+arrests_tn_moving_average <- arrests_tn %>%
+  mutate(arrests_day = floor_date(arrests_apprehension_date, unit = 'days')) %>%
+  group_by(arrests_day) %>%
+  count() %>%
+  arrange(arrests_day) %>%
+  ungroup() %>%
+  mutate(ma_val = rollmean(n, k = 10, fill = NA, align = 'left'))
+
+write.csv(arrests_tn_moving_average, paste0(OUTPUT_FP, 'arrests_tn_moving_average.csv'))
+
+# plot moving average of TN arrests
+ggplot(arrests_tn_moving_average, aes(x = arrests_day, y = ma_val))+
+  geom_line()+
+  geom_vline(xintercept = as.POSIXct('2025-01-20'), color = 'red')+
+  annotate('rect', xmin = as.POSIXct('2025-04-08'), xmax = as.POSIXct(OP_END),
+           ymin = -Inf, ymax = Inf, fill = 'lightblue', alpha = 0.6)+
+  labs(x = '', y = 'daily arrests', 
+       title = 'Tennessee daily arrests',
+       subtitle = '10 day moving average, blue area represents highway patrol action in the Nashville area')+
+  theme_bw()
+
+ggsave(paste0(OUTPUT_FP, 'TN_daily_arrests_moving_avrg.png'), width =  8, height = 6)
+
+# citizenship breakdown of TN arrestees
+arrests_tn_citizenship <- arrests_tn %>%
+  group_by(arrests_after_Trump, arrests_citizenship_country) %>%
+  count() %>%
+  group_by(arrests_after_Trump) %>%
+  mutate(share = n/sum(n)) %>%
+  ungroup() %>%
+  filter(share > 0.03)
+
+write.csv(arrests_tn_citizenship, paste0(OUTPUT_FP, 'arrests_tn_citizenship.csv'))
+
+# citizenship breakdown nationwide
+arrests_citizenship <- arrests_oct %>%
+  group_by(arrests_after_Trump, arrests_citizenship_country) %>%
+  count() %>%
+  group_by(arrests_after_Trump) %>%
+  mutate(share = n/sum(n)) %>%
+  ungroup() %>%
+  filter(share > 0.03)
+
+write.csv(arrests_citizenship, paste0(OUTPUT_FP, 'arrests_citizenship.csv'))
+
+ggplot(arrests_tn_citizenship, aes(x = arrests_citizenship_country, y = share, fill = as.factor(arrests_after_Trump)))+
+  geom_bar(stat = 'identity', position = position_dodge())+
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1))
+
+ggsave(paste0(OUTPUT_FP, 'arrests_tn_citizenship.png'), width = 8, height = 6)
+
+# children
+arrests_tn_children <- arrests_tn %>%
+  group_by(arrests_birth_year >= 2006, arrests_after_Trump) %>%
+  count()
+
+write.csv(arrests_tn_children, paste0(OUTPUT_FP, 'arrests_tn_children.csv'))
+```
+
+## NSV Raid
+### Use of the NSV general area code
+```{r}
+# extract all landmark fields for TN arrests
+arrests_tn_landmark <- arrests_tn %>%
+  group_by(arrests_apprehension_site_landmark, arrests_after_Trump) %>%
+  count()
+
+write.csv(arrests_tn_landmark, paste0(OUTPUT_FP, 'arrests_tn_landmark.csv'))
+
+# extract all arrests with landmark == 'NSV GENERAL AREA, NON-SPECIFIC'
+arrests_NSV_GEN_AREA <- arrests_oct %>%
+  filter(arrests_apprehension_site_landmark == 'NSV GENERAL AREA, NON-SPECIFIC')
+
+# plot distribution of arrests with landmark == 'NSV GENERAL AREA, NON-SPECIFIC' over time
+ggplot(arrests_NSV_GEN_AREA, aes(x = arrests_apprehension_date))+
+  geom_density(adjust = 0.3)+
+  labs(x = 'date', title = 'NSV GENERAL AREA arrestees', y = '')+
+  theme_bw()
+
+ggsave(paste0(OUTPUT_FP, 'arrests_NSV_GENERAL_AREA.png'), width = 8, height = 6)
+
+# extract all encounters with landmark == 'NSV GENERAL AREA, NON-SPECIFIC'
+encounters_NSV_GENERAL_AREA <- encounters_jul %>%
+  filter(encounters_event_landmark == 'NSV GENERAL AREA, NON-SPECIFIC')
+
+# plot distribution of encounters with landmark == 'NSV GENERAL AREA, NON-SPECIFIC' over time
+ggplot(encounters_NSV_GENERAL_AREA, aes(x = encounters_event_date))+
+  geom_density(adjust = 0.3)+
+  labs(x = 'date', title = 'NSV GENERAL AREA encounters', y = '')+
+  theme_bw()
+
+ggsave(paste0(OUTPUT_FP, 'encounters_NSV_GENERAL_AREA.png'), width = 8, height = 6)
+```
+
+
+### Identifying NSV arrestees
+```{r}
+OUTPUT_FP_NSV_SAMPLES <- paste0(OUTPUT_FP, 'nsv_samples/')
+dir.create(OUTPUT_FP_NSV_SAMPLES, showWarnings = F)
+
+# extract arrests based on July dataset
+arrests_nsv_jul <- arrests_jul %>%
+  filter(arrests_apprehension_aor == 'New Orleans Area of Responsibility',
+         arrests_apprehension_date > as.Date(OP_START),
+         arrests_apprehension_date < as.Date(OP_END),
+         arrests_apprehension_site_landmark == 'NSV GENERAL AREA, NON-SPECIFIC')
+# Too few arrestees relative to ICE numbers, but almost everybody matched except Howard King
+write.csv(arrests_nsv_jul, paste0(OUTPUT_FP_NSV_SAMPLES, 'arrests_nsv_jul.csv'))
+
+
+# extract arrests based on October dataset
+arrests_nsv_oct <- arrests_oct %>%
+  filter(arrests_apprehension_aor == 'New Orleans Area of Responsibility',
+         arrests_apprehension_date > as.Date(OP_START),
+         arrests_apprehension_date < as.Date(OP_END),
+         arrests_apprehension_site_landmark == 'NSV GENERAL AREA, NON-SPECIFIC')
+# contains every confirmed arrest, incl. Howard King => preferred dataset
+
+write.csv(arrests_nsv_oct, paste0(OUTPUT_FP_NSV_SAMPLES, 'arrests_nsv_oct.csv'))
+
+arrests_nsv_jul %>%
+  ggplot(aes(x = arrests_apprehension_date))+
+  geom_density()+
+  labs(title = 'Arrests in Nashville Area between May 1 and May 13',
+       x = '', y = '')+
+  theme_bw()
+
+# identifying the arrsts in other datasets
+# detentions short July
+detentions_short_nsv_jul <- detentions_short_jul %>%
+  filter(detentions_unique_identifier %in% arrests_nsv_jul$arrests_unique_identifier) %>%
+  group_by(detentions_unique_identifier) %>%
+  slice_max(order_by = detentions_stay_book_in_date_time) %>%
+  ungroup()
+
+write.csv(detentions_short_nsv_jul, paste0(OUTPUT_FP_NSV_SAMPLES, 'detentions_short_nsv_jul.csv'))
+
+# detentions July
+detentions_nsv_jul <- detentions_jul %>%
+  filter(detentions_unique_identifier %in% arrests_nsv_jul$arrests_unique_identifier)%>%
+  group_by(detentions_unique_identifier) %>%
+  slice_max(order_by = detentions_stay_book_in_date_time) %>%
+  ungroup()
+
+write.csv(detentions_nsv_jul, paste0(OUTPUT_FP_NSV_SAMPLES, 'detentions_nsv_jul.csv'))
+
+# detentions short October
+detentions_short_nsv_oct <- detentions_short_oct %>%
+  filter(detentions_unique_identifier %in% arrests_nsv_oct$arrests_unique_identifier) %>%
+  group_by(detentions_unique_identifier) %>%
+  slice_max(order_by = detentions_stay_book_in_date_time) %>%
+  ungroup()
+
+write.csv(detentions_short_nsv_oct, paste0(OUTPUT_FP_NSV_SAMPLES, 'detentions_short_nsv_oct.csv'))
+
+# detentions October
+detentions_nsv_oct <- detentions_oct %>%
+  filter(detentions_unique_identifier %in% arrests_nsv_oct$arrests_unique_identifier)%>%
+  group_by(detentions_unique_identifier) %>%
+  slice_max(order_by = detentions_stay_book_in_date_time) %>%
+  ungroup()
+
+write.csv(detentions_nsv_oct, paste0(OUTPUT_FP_NSV_SAMPLES, 'detentions_nsv_oct.csv'))
+
+# removals July
+removals_nsv_jul <- removals_jul %>%
+  filter(removals_unique_identifier %in% arrests_nsv_jul$arrests_unique_identifier, removals_departed_date > as.Date('2025-04-07'))
+
+write.csv(removals_nsv_jul, paste0(OUTPUT_FP_NSV_SAMPLES, 'removals_nsv_jul.csv'))
+```
+
+### Robustness checks that I have the best possible sample
+```{r}
+# arrests contained in the October but not July sample (based on exact apprehension minute since IDs don't match)
+arrests_nsv_oct_not_in_jul <- arrests_nsv_oct %>%
+  filter(!(arrests_apprehension_date %in% arrests_nsv_jul$arrests_apprehension_date))
+# looks like they added Howard King and other voluntary departures as arrests post facto. 2 more cases with slightly unclear status.
+# but basically means we should probably use Oct rather than Jul sample. Also important to acknowledge that there will be errors, but unclear if 
+# ICE has anything better on their side. I'd be surprised if they did
+
+
+# Might they have counted encounters, instead
+encounters_nsv_trial <- encounters_jul %>%
+  filter(encounters_responsible_aor == 'New Orleans Area of Responsibility',
+         encounters_event_landmark == 'NSV GENERAL AREA, NON-SPECIFIC') %>%
+  filter(encounters_event_date > as.Date('2025-04-30'),
+         encounters_event_date < as.Date(OP_END))
+
+# encounters not in the arrests dataset
+encounters_not_in_arrests <- encounters_nsv_trial %>%
+  filter(!(encounters_unique_identifier %in% arrests_nsv_jul$arrests_unique_identifier))
+# missingness definitely small -> potentially some arrestees who departed immediately like Howard King. But max 5; overall number even smaller
+
+# Might they have counted new detainees in area jails?
+detentions_short_nsv_trial <- detentions_short_jul %>%
+  filter(detentions_detention_facility_code %in% c('NSVHOLD', 'PUTNMTN'), 
+         detentions_stay_book_in_date_time > as.Date(OP_START),
+         detentions_stay_book_in_date_time < as.Date(OP_END))
+
+arrests_based_on_detentions <- arrests_jul %>%
+  filter(arrests_unique_identifier %in% detentions_short_nsv_trial$detentions_unique_identifier)
+# everybody is either arrests NSV general area or arrested at a jail, in which case they were not arrested through the operation. 2 people mismatch, at least one of which is Howard King
+
+# if we had a lot of detainers that would call into question that people were picked up during the operation
+detainers_nsv_oct <- detainers_oct %>%
+  filter(detainers_unique_identifier %in% c(arrests_nsv_oct$arrests_unique_identifier))
+# Detainers pre ~ April 25 are not an issue. This leaves us with 7 detainers. 3-4 are of people likely misclassified as part of the operation. We may want to exclude them! the rest is for people presumably released in the context of the raid but later arrested again and a detainer was issued for them.
+```
+
+
+### Simple descriptives of the arrestees
+```{r}
+### nationality breakdowns
+arrests_nsv_citizenship <- arrests_nsv_oct %>%
+  group_by(arrests_citizenship_country) %>%
+  count() %>%
+  arrange(desc(n))
+
+write.csv(arrests_nsv_citizenship, paste0(OUTPUT_FP, 'arrests_nsv_citizenship.csv'))
+
+### gender breakdowns
+arrests_nsv_gender <- arrests_nsv_oct %>%
+  group_by(arrests_gender) %>%
+  count() %>%
+  arrange(desc(n))
+
+write.csv(arrests_nsv_gender, paste0(OUTPUT_FP, 'arrests_nsv_gender.csv'))
+
+### age breakdowns
+ggplot(arrests_nsv_oct, aes(x = arrests_birth_year))+
+  geom_histogram()
+
+ggsave(paste0(OUTPUT_FP, 'arrests_nsv_age.png'), width = 8, height = 6)
+
+### criminality
+arrests_nsv_criminality <- arrests_nsv_oct %>%
+  group_by(arrests_apprehension_criminality) %>%
+  count() %>%
+  arrange(desc(n))
+
+write.csv(arrests_nsv_criminality, paste0(OUTPUT_FP, 'arrests_nsv_criminality.csv'))
+
+detentions_nsv_msc <- detentions_short_nsv_oct %>%
+  group_by(detentions_msc_charge) %>%
+  count() %>%
+  arrange(desc(n))
+
+write.csv(detentions_nsv_msc, paste0(OUTPUT_FP, 'detentions_nsv_msc.csv'))
+
+
+detentions_nsv_threat <- detentions_short_nsv_oct %>%
+  group_by(detentions_case_threat_level) %>%
+  count() %>% 
+  ungroup() %>%
+  mutate(share = n/sum(n,na.rm = T)) %>%
+  arrange(desc(n))
+
+write.csv(detentions_nsv_threat, paste0(OUTPUT_FP, 'detentions_nsv_threat.csv'))
+
+### First ICE detention facility
+detentions_nsv_first_fac <- detentions_short_nsv_oct %>%
+  group_by(detentions_detention_facility) %>%
+  count() %>%
+  arrange(desc(n))
+
+write.csv(detentions_nsv_first_fac, paste0(OUTPUT_FP, 'detentions_nsv_first_fac.csv'))
+
+serious_crim <- detentions_short_nsv_oct %>%
+  filter(detentions_case_threat_level == 1) %>%
+  dplyr::select(detentions_unique_identifier, detentions_msc_charge) %>%
+  left_join(arrests_nsv_oct %>% dplyr::select(arrests_apprehension_date, arrests_unique_identifier), 
+            by = c('detentions_unique_identifier' = 'arrests_unique_identifier'))
+
+write.csv(serious_crim, paste(OUTPUT_FP, 'level_1_criminals_nsv.csv'))
+
+# What happened to the individuals?
+detentions_nsv_release_reason <- detentions_short_nsv_oct %>%
+  group_by(detentions_stay_release_reason) %>%
+  count() %>%
+  arrange(desc(n))
+
+write.csv(detentions_nsv_release_reason, paste0(OUTPUT_FP, 'detentions_nsv_release_reason.csv'))
+
+# released dataset
+released_individuals <- detentions_nsv_oct %>%
+  filter(detentions_stay_release_reason %in% c('Bonded Out - IJ', 'Order of recognizance')) %>%
+  group_by(detentions_unique_identifier) %>%
+  slice_max(detentions_detention_book_out_date_time, n = 1)
+
+write.csv(released_individuals, paste0(OUTPUT_FP, 'released_individuals.csv'))
+
+# immigration status
+arrests_case_cat <- arrests_nsv_oct %>%
+  group_by(arrests_case_category) %>%
+  count()
+
+write.csv(arrests_case_cat, paste0(OUTPUT_FP, 'arrests_case_cat.csv'))
+
+# children dataset
+arrests_nsv_children <- arrests_nsv_oct %>%
+  filter(arrests_birth_year >= 2006, arrests_after_Trump == 1)
+
+nrow(arrests_nsv_children)
+write.csv(arrests_nsv_children, paste0(OUTPUT_FP, 'arrests_nsv_children.csv'))
+```
+
+### map detention history
+```{r}
+# compute daily observation for each detainee
+facility_day <- detentions_nsv_oct %>%
+  filter(detentions_book_in_date_time < LAST_DATE) %>%
+  mutate(detentions_detention_book_out = as.Date(ifelse(is.na(detentions_detention_book_out_date_time), LAST_DATE, as.Date(detentions_detention_book_out_date_time)))) %>%
+  rowwise() %>%
+  mutate(date = list(seq.Date(as.Date(detentions_book_in_date_time),
+                              as.Date(detentions_detention_book_out), 
+                              by = "day"))) %>%
+  unnest(date) %>%
+  filter(date > as.Date('2025-04-07'))
+
+# compute number of detainees by day and facility
+nodes_day <- facility_day %>%
+  group_by(detentions_detention_facility_code, date) %>%
+  count() %>%
+  ungroup() %>%
+  mutate(date = as.Date(date)) %>%
+  left_join(facilities %>% dplyr::select(detention_facility_code, longitude, latitude), 
+            by = c('detentions_detention_facility_code' = 'detention_facility_code'))
+
+# compute transfers between facilities by day
+edges_day <- facility_day %>%
+  group_by(detentions_unique_identifier, date) %>%
+  mutate(n = n()) %>%
+  filter(n > 1) %>% # excludes person-days without transfers
+  mutate(direction = case_when(
+      row_number() == 1 ~ "from", 
+      row_number() == 2 ~ "to",
+      TRUE ~ NA_character_
+    )) %>%
+  ungroup() %>%
+  dplyr::select(date, detentions_unique_identifier, detentions_detention_facility_code, direction) %>%
+  pivot_wider(id_cols = c('date', 'detentions_unique_identifier'), names_from = direction, values_from = detentions_detention_facility_code) %>%
+  group_by(date, from, to) %>%
+  count() %>%
+  left_join(facilities %>% 
+               dplyr::select(detention_facility_code, longitude, latitude) %>%
+               rename(from_long = longitude, from_lat = latitude), 
+            by = c('from' = 'detention_facility_code')) %>%
+  left_join(facilities %>% 
+               dplyr::select(detention_facility_code, longitude, latitude) %>%
+               rename(to_long = longitude, to_lat = latitude), 
+            by = c('to' = 'detention_facility_code'))
+
+# deported, when/where
+deported <- arrests_nsv_oct %>%
+  filter(!is.na(arrests_departed_date), arrests_departed_date < LAST_DATE) %>%
+  dplyr::select(arrests_unique_identifier, arrests_departed_date, arrests_departure_country)
+
+# last detention obs
+last_detention <- detentions_nsv_oct %>%
+  group_by(detentions_unique_identifier) %>%
+  slice_max(detentions_book_in_date_time, n = 1) %>%
+  ungroup()
+
+# deportation edges: from final ICE detention facility to country of deportation  
+deportation_edges <- deported %>%
+  left_join(last_detention, by = c('arrests_unique_identifier' = 'detentions_unique_identifier')) %>%
+  group_by(arrests_departed_date, arrests_departure_country, detentions_detention_facility_code) %>%
+  count() %>%
+  left_join(facilities %>% 
+               dplyr::select(detention_facility_code, longitude, latitude) %>%
+               rename(from_long = longitude, from_lat = latitude), 
+            by = c('detentions_detention_facility_code' = 'detention_facility_code'))
+
+# save mapping files  
+write.csv(nodes_day, paste0(OUTPUT_FP, 'nodes.csv')) 
+write.csv(edges_day, paste0(OUTPUT_FP, 'edges.csv')) 
+write.csv(deportation_edges, paste0(OUTPUT_FP, 'deportation_edges.csv'))
+
+top3_nodes_day <- nodes_day %>%
+  group_by(date) %>%
+  slice_max(order_by = n, n = 3) %>%
+  ungroup()
+
+
+# animate as GIF
+p <- ggplot()+
+  annotation_borders("state")+
+  geom_point(data = nodes_day, aes(x = longitude, y = latitude, size = n))+
+  scale_size(range = c(2, 12)) +
+  geom_segment(
+    data = edges_day,
+    aes(x = from_long, y = from_lat, xend = to_long, yend = to_lat, linewidth = n),
+    color = "red", alpha = 0.4,
+    arrow = arrow(length = unit(0.35, "cm"), type = "closed")
+  ) +
+  geom_text_repel(data = top3_nodes_day,
+            aes(longitude, latitude, label = detentions_detention_facility_code),   # or label = id, etc.
+            size = 4,
+            fontface = "bold",
+            min.segment.length = 0,     # always draw a segment
+            box.padding = 0.5,          # how far labels push away from the node
+            point.padding = 0.4,        # space around the point
+            max.overlaps = Inf)+
+  labs(title = "Day: {closest_state}", size = "Value")+
+  transition_states(states = date,
+    transition_length = 0,
+    state_length = 1) +
+  ease_aes('linear') +
+  xlim( -110, -80)+
+  ylim(22, 40)+
+  theme_bw()
+
+
+# animation doesn't save yet
+a <- animate(p, width=800, height=600, duration=28, fps=4, renderer = gifski_renderer()) 
+anim_save(paste0(OUTPUT_FP, "map_animation.gif"), a)
+```
+
+
+## Memphis Raid
+```{r}
+# extract first detention stints in Memphis area detention facilities
+detentions_short_mem <- detentions_short_oct %>%
+  filter(detentions_detention_facility_code %in% c('BOPMEM', 'MEMHOLD', 'TNWESDF')) %>%
+  mutate(book_in_day = lubridate::floor_date(detentions_stay_book_in_date_time, unit = 'week')) %>%
+  group_by(book_in_day) %>%
+  count()
+
+write.csv(detentions_short_mem, paste0(OUTPUT_FP, 'detentions_short_mem.csv'))
+
+# plot 
+ggplot(detentions_short_mem, aes(x = book_in_day, y = n))+
+  geom_bar(stat = 'identity')+
+  labs(x = 'date', y = 'detainees',
+       title = 'Weekly first-time detainees in MEM ICE facilities')+
+  theme_bw()
+
+```
+
+## Identifying Individuals
+#### Edgardo David Campos
+https://www.wsmv.com/2025/05/14/first-arrive-last-leave-man-detained-by-ice-nashville-is-beloved-church-member-family-says/
+```{r}
+#DPD
+arrests_CAMPOS <- arrests_oct %>%
+  filter(arrests_apprehension_aor == 'New Orleans Area of Responsibility', 
+         arrests_birth_year %in% c(1969, 1970),
+         arrests_citizenship_country == 'EL SALVADOR',
+         arrests_apprehension_date > as.Date('2025-05-08'),
+         arrests_apprehension_date < as.Date('2025-05-11')) %>%
+  mutate(name = 'CAMPOS')
+
+arrests_CAMPOS$arrests_unique_identifier
+
+### TN HP
+# known location of arrest
+mapco_point <- st_sfc(st_point(c(-86.69239, 36.08707)), crs = 4326) 
+
+pr_short_geo_m <- st_transform(pr_short_geo, 3857)
+mapco_point_m <- st_transform(mapco_point, 3857)
+
+# identify Campos arrest record based on known location
+df_filtered <- pr_short_geo_m[st_distance(pr_short_geo_m, mapco_point_m) <= units::set_units(500, "m"), ]
+# two entries returned, one very clearly not at the MAPCO fuel stop. I think we re good saying that the MAPCO arrest is Campos
+
+pr_CAMPOS <- pr_short %>%
+  filter(grepl('mapco', location_clean, ignore.case = T))
+
+pr_CAMPOS$event
+```
+
+#### Howard John King
+```{r}
+# DPD
+arrests_KING <- arrests_oct %>%
+  filter(arrests_apprehension_aor == 'New Orleans Area of Responsibility', 
+         arrests_citizenship_country == 'BAHAMAS',
+         arrests_apprehension_state == 'TENNESSEE',
+         arrests_apprehension_date > as.Date('2025-05-02'),
+         arrests_apprehension_date < as.Date('2025-05-05')) %>%
+  mutate(name = 'KING')
+
+arrests_KING$arrests_unique_identifier
+
+# TN HWP
+pr_KING <- pr_short %>%
+  filter(grepl('king', involved_persons_last_name, ignore.case = T))
+
+pr_KING$event
+```
+
+### Eduardo Ontiveros
+```{r}
+arrests_ONTIVEROS <- arrests_oct %>%
+   filter(arrests_apprehension_aor == 'New Orleans Area of Responsibility', 
+         arrests_birth_year == 1968,
+         arrests_citizenship_country == 'MEXICO',
+         arrests_apprehension_date > as.Date('2025-05-03'),
+         arrests_apprehension_date < as.Date('2025-05-05')) %>%
+  mutate(name = 'ONTIVEROS')
+
+arrests_ONTIVEROS$arrests_unique_identifier
+```
+
+
+
+
+#### Finding individuals from the DHS press release
+
+https://www.dhs.gov/news/2025/05/13/dhs-announces-successful-operation-287g-partners-nashville-resulting-arrests-ms-13
+```{r}
+### Jassim Jafaf Al-Raash ###
+arrests_AL_RAASH <- arrests_oct %>%
+  filter(arrests_apprehension_aor == 'New Orleans Area of Responsibility', 
+         arrests_birth_year %in% c(1964, 1965),
+         arrests_citizenship_country == 'IRAQ',
+         arrests_apprehension_date > as.Date('2025-04-01'),
+         arrests_apprehension_date < as.Date(OP_END)) %>%
+  mutate(name = 'AL RAASH')
+
+detentions_short_oct %>%
+  filter(detentions_unique_identifier %in% arrests_AL_RAASH$arrests_unique_identifier) %>%
+  dplyr::select(detentions_msc_charge)
+# detentions dataset confirms rape MSC
+
+### Franklin Oswaldo Velasquez & Inmar Antonio Penado-Membreno ###
+arrests_VALASQUEZ_PENADO_MEM <- arrests_oct %>%
+  filter(arrests_apprehension_aor == 'New Orleans Area of Responsibility', 
+         arrests_citizenship_country == 'EL SALVADOR',
+         arrests_birth_year %in% c(1990, 1991, 1992),
+         arrests_apprehension_date > as.Date('2025-04-01'),
+         arrests_apprehension_date < as.Date(OP_END),
+         arrests_apprehension_state == 'TENNESSEE',
+         arrests_gender == 'Male',
+         arrests_apprehension_method != 'CAP Local Incarceration') %>%
+  filter(arrests_unique_identifier %in% c('116b5ee245b532ba90ec8c1e2c6e8d84e5bbb443',
+                                          '74c488c3083f7209273ff91c39dd89b8c58c14b0')) %>%
+  mutate(name = case_when(arrests_unique_identifier == '116b5ee245b532ba90ec8c1e2c6e8d84e5bbb443' ~ 'VALASQUEZ',
+                          arrests_unique_identifier == '74c488c3083f7209273ff91c39dd89b8c58c14b0' ~ 'PENADO-MEMBRENO',
+                          T ~ NA_character_))
+
+detentions_short_oct %>%
+  filter(detentions_unique_identifier %in% arrests_VALASQUEZ_PENADO_MEM$arrests_unique_identifier) %>%
+  dplyr::select(detentions_msc_charge, detentions_book_in_criminality)
+
+# Based on birth years, 74c488c3083f7209273ff91c39dd89b8c58c14b0 should be Penado-Membreno and 116b5ee245b532ba90ec8c1e2c6e8d84e5bbb443 would be Velasquez (convictions match it seems)
+
+### Richard St. Baptiste
+arrests_BAPTISTE <- arrests_oct %>%
+  filter(arrests_apprehension_aor == 'New Orleans Area of Responsibility',
+         arrests_apprehension_date > as.Date('2025-04-01'),
+         arrests_apprehension_date < as.Date(OP_END),
+         arrests_apprehension_state == 'TENNESSEE',
+         arrests_citizenship_country == 'HAITI', 
+         arrests_birth_year %in% c(1988, 1989)) %>%
+  mutate(name = 'ST. BAPTISTE')
+
+detentions_short_jul %>%
+  filter(detentions_unique_identifier == arrests_BAPTISTE$arrests_unique_identifier) %>%
+  dplyr::select(detentions_msc_charge, detentions_book_in_criminality)
+
+### Carlos Reinaldo Alvarado-Rodriguez
+arrests_ALVARADO_RODRIGUEZ <- arrests_oct %>%
+  filter(arrests_apprehension_aor == 'New Orleans Area of Responsibility',
+         arrests_apprehension_date > as.Date('2025-04-01'),
+         arrests_apprehension_date < as.Date(OP_END),
+         arrests_citizenship_country == 'GUATEMALA', 
+         arrests_birth_year %in% c(1985, 1986),
+         arrests_apprehension_state == 'TENNESSEE',
+         arrests_apprehension_site_landmark == 'NSV GENERAL AREA, NON-SPECIFIC') %>%
+  mutate(name = 'ALVARADO RODRIGUEZ')
+
+detentions_oct %>%
+  filter(detentions_unique_identifier == arrests_ALVARADO_RODRIGUEZ$arrests_unique_identifier) %>%
+  dplyr::select(detentions_msc_charge, detentions_book_in_criminality)
+```
+#### Combine all individuals into single DF
+```{r}
+identified_arrests_comb <- arrests_CAMPOS %>%
+  bind_rows(arrests_KING) %>%
+  bind_rows(arrests_ONTIVEROS) %>%
+  bind_rows(arrests_AL_RAASH) %>%
+  bind_rows(arrests_VALASQUEZ_PENADO_MEM) %>%
+  bind_rows(arrests_BAPTISTE)  %>%
+  bind_rows(arrests_ALVARADO_RODRIGUEZ)
+
+write.csv(identified_arrests_comb, paste0(OUTPUT_FP, 'identified_arrests_comb.csv'))
+
+identified_detentions <- identified_arrests_comb %>%
+  dplyr::select(arrests_unique_identifier, name) %>%
+  left_join(detentions_oct, by = c('arrests_unique_identifier' = 'detentions_unique_identifier'))
+
+write.csv(identified_detentions, paste0(OUTPUT_FP, 'identified_detentions.csv'))
+
+```
+

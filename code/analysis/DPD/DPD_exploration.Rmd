@@ -1,0 +1,224 @@
+---
+title: "DPD exploration"
+author: "Justin Braun"
+date: "2025-10-29"
+output: pdf_document
+---
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Load libraries
+```{r}
+library(dplyr)
+library(tidyr)
+library(lubridate)
+library(arrow)
+library(ggplot2)
+library(purrr)
+```
+
+## Set up global variables
+```{r}
+INPUT_FP <- '../../../data/intermediate/DPD/2507_' # use July release
+OUTPUT_FP <- '../../../data/results/DPD/exploration/'
+
+dir.create(OUTPUT_FP, showWarnings = F)
+```
+
+
+## Load data
+```{r}
+arrests <- read_feather(paste0(INPUT_FP, 'arrests.feather'))
+detainers <- read_feather(paste0(INPUT_FP, 'detainers.feather'))
+encounters <- read_feather(paste0(INPUT_FP, 'encounters.feather'))
+detentions <- read_feather(paste0(INPUT_FP, 'detentions.feather'))
+detentions_short <- read_feather(paste0(INPUT_FP, 'detentions_short.feather'))
+removals <- read_feather(paste0(INPUT_FP, 'removals.feather'))
+```
+
+
+## Relation between datasets
+
+### Overlap of unique IDs
+```{r}
+#unique ids for each dataset
+unique_id_list <- list(
+  encounters = unique(encounters$encounters_unique_identifier),
+  arrests = unique(arrests$arrests_unique_identifier),
+  detainers = unique(detainers$detainers_unique_identifier),
+  detentions = unique(detentions$detentions_unique_identifier),
+  removals = unique(removals$removals_unique_identifier)
+)
+
+# Compute pairwise overlaps
+# overlap count matrix
+n <- length(unique_id_list)
+overlap_matrix <- matrix(0, nrow = n, ncol = n)
+rownames(overlap_matrix) <- colnames(overlap_matrix) <- names(unique_id_list)
+
+for (i in 1:n) {
+  for (j in 1:n) {
+    overlap_matrix[i, j] <- length(intersect(unique_id_list[[i]], unique_id_list[[j]]))
+  }
+}
+
+print(overlap_matrix)
+
+# overlap share matrix
+n <- length(unique_id_list)
+share_matrix <- matrix(0, nrow = n, ncol = n)
+rownames(share_matrix) <- colnames(share_matrix) <- names(unique_id_list)
+
+for (i in 1:n) {
+  for (j in 1:n) {
+    intersect_size <- length(intersect(unique_id_list[[i]], unique_id_list[[j]]))
+    union_size <- length(union(unique_id_list[[i]], unique_id_list[[j]]))
+    share_matrix[i, j] <- intersect_size / union_size
+  }
+}
+
+print(round(share_matrix, 2))
+
+# subset matrix
+n <- length(unique_id_list)
+subset_matrix <- matrix(0, nrow = n, ncol = n)
+rownames(subset_matrix) <- colnames(subset_matrix) <- names(unique_id_list)
+
+for (i in 1:n) {
+  for (j in 1:n) {
+    intersection_size <- length(intersect(unique_id_list[[i]], unique_id_list[[j]]))
+    target_size <- length(unique(unique_id_list[[j]]))
+    subset_matrix[i, j] <- intersection_size / target_size
+  }
+}
+
+print(round(subset_matrix, 2))
+```
+### Missing unique identifiers
+```{r}
+mean(is.na(encounters$encounters_unique_identifier))
+mean(is.na(arrests$arrests_unique_identifier))
+mean(is.na(detainers$detainers_unique_identifier))
+mean(is.na(detentions$detentions_unique_identifier))
+mean(is.na(removals$removals_unique_identifier))
+```
+### Which dataset comes first
+Detentions and removals seem pretty obvious, but encounters, arrests, and detainers much less so. To avoid multiple matches, we'll just keep the most recent observations for each unique ID. There are some issues with this approach but this is just meant to give us high-level understanding of the data.
+```{r}
+# merge arrests and detainers
+arrests_detainers <- arrests %>%
+  filter(!is.na(arrests_unique_identifier)) %>%
+  arrange(arrests_unique_identifier, desc(arrests_apprehension_date)) %>%
+  distinct(arrests_unique_identifier, .keep_all = T) %>%
+  inner_join(detainers %>%
+               filter(!is.na(detainers_unique_identifier)) %>%
+               arrange(detainers_unique_identifier, desc(detainers_detainer_prepare_date)) %>%
+               distinct(detainers_unique_identifier, .keep_all = T), 
+             by = c('arrests_unique_identifier' = 'detainers_unique_identifier')) %>%
+  mutate(detainer_arrest_diff = round(difftime(arrests_apprehension_date, detainers_detainer_prepare_date, units = 'days'), digits = 0))
+
+# plot time difference distribution
+ggplot(arrests_detainers, aes(detainer_arrest_diff))+
+  geom_histogram()+
+  xlim(-200, 200)+
+  labs(title = 'Arrest Date - Detainer Date',
+       x = 'Date diff')
+
+# merge arrests and encounters
+arrests_encounters <- arrests %>%
+  filter(!is.na(arrests_unique_identifier)) %>%
+  arrange(arrests_unique_identifier, desc(arrests_apprehension_date)) %>%
+  distinct(arrests_unique_identifier, .keep_all = T) %>%
+  inner_join(encounters %>%
+               filter(!is.na(encounters_unique_identifier)) %>%
+               arrange(encounters_unique_identifier, desc(encounters_event_date)) %>%
+               distinct(encounters_unique_identifier, .keep_all = T), 
+             by = c('arrests_unique_identifier' = 'encounters_unique_identifier')) %>%
+  mutate(encounter_arrest_diff = round(difftime(arrests_apprehension_date, encounters_event_date, units = 'days'), digits = 0))
+
+# plot time difference distribution
+ggplot(arrests_encounters, aes(encounter_arrest_diff))+
+  geom_histogram()+
+  xlim(-200, 200)+
+  labs(title = 'Arrest Date - Encounter Date',
+       x = 'Date diff')
+
+# merge arrests and encounters
+detainers_encounters <- detainers %>%
+  filter(!is.na(detainers_unique_identifier)) %>%
+  group_by(detainers_unique_identifier) %>%
+  arrange(desc(detainers_detainer_prepare_date)) %>%
+  slice(1) %>%
+  ungroup() %>%
+  inner_join(encounters %>%
+               filter(!is.na(encounters_unique_identifier)) %>%
+               group_by(encounters_unique_identifier) %>%
+               arrange(desc(encounters_event_date)) %>%
+               slice(1) %>%
+               ungroup(),
+             by = c('detainers_unique_identifier' = 'encounters_unique_identifier')) %>%
+  mutate(encounter_detainer_diff = round(difftime(detainers_detainer_prepare_date, encounters_event_date, units = 'days'), digits = 0))
+
+# plot time difference distribution
+ggplot(detainers_encounters, aes(encounter_detainer_diff))+
+  geom_histogram()+
+  xlim(-200, 200)+
+  labs(title = 'Detainer Date - Encounter Date',
+       x = 'Date diff')
+```
+
+### Do columns agree with each other
+```{r}
+#demographics
+table(arrests_detainers$arrests_birth_year == arrests_detainers$detainers_birth_year)
+table(arrests_detainers$arrests_citizenship_country == arrests_detainers$detainers_citizenship_country)
+
+table(arrests_encounters$arrests_birth_year==arrests_encounters$encounters_birth_year)
+table(arrests_encounters$arrests_citizenship_country == arrests_encounters$encounters_citizenship_country)
+
+# case information
+table(arrests_detainers$arrests_final_program == arrests_detainers$detainers_final_program)
+table(arrests_detainers$arrests_departed_date == arrests_detainers$detainers_departed_date)
+
+table(arrests_encounters$arrests_final_program==arrests_encounters$encounters_final_program)
+table(arrests_encounters$arrests_departed_date == arrests_encounters$encounters_departed_date)
+```
+
+## Variable Counts
+Count variable values in the pre and post Trump period
+```{r}
+OUTPUT_FP_VAR_COUNTS <- paste0(OUTPUT_FP, 'var_counts/')
+dir.create(OUTPUT_FP_VAR_COUNTS, showWarnings = F)
+
+
+var_counts <- function(df, var_name, fp){
+  df$cur_var <- df[[var_name]]
+  
+  if(grepl('after_Trump', var_name) || length(unique(df$cur_var)) > 25) return(invisible())
+  
+  cur_df <- df %>%
+    group_by(cur_var, across(ends_with('after_Trump'))) %>%
+    count()
+  
+  write.csv(cur_df, fp)
+}
+
+trash <- map(names(arrests), function(x) var_counts(arrests, x, paste0(OUTPUT_FP_VAR_COUNTS, x, '.csv')), .progress = T)
+trash <- map(names(detainers), function(x) var_counts(detainers, x, paste0(OUTPUT_FP_VAR_COUNTS, x, '.csv')), .progress = T)
+trash <- map(names(encounters), function(x) var_counts(encounters, x, paste0(OUTPUT_FP_VAR_COUNTS, x, '.csv')), .progress = T)
+trash <- map(names(detentions), function(x) var_counts(detentions, x, paste0(OUTPUT_FP_VAR_COUNTS, x, '.csv')), .progress = T)
+trash <- map(names(removals), function(x) var_counts(removals, x, paste0(OUTPUT_FP_VAR_COUNTS, x, '.csv')), .progress = T)
+```
+
+
+
+
+
+
+
+
+
+
+
+

@@ -1,0 +1,560 @@
+---
+title: "DPD national"
+author: "Justin Braun"
+date: "2025-10-29"
+output: pdf_document
+---
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Load libraries
+```{r}
+library(dplyr)
+library(tidyr)
+library(lubridate)
+library(arrow)
+library(ggplot2)
+library(openxlsx)
+library(stringr)
+library(sf)
+library(stringr)
+library(data.table)
+```
+
+## Set up global variables
+```{r}
+INPUT_FP <- '../../../data/intermediate/DPD/2510_' #Use October release
+OUTPUT_FP <- '../../../data/results/DPD/national/'
+
+dir.create(OUTPUT_FP, showWarnings = F)
+
+# add days as global variable and replace throughout
+POST_TRUMP_DAYS <- as.numeric(difftime(as.Date('2025-10-15'), as.Date('2025-01-20')))
+PRE_TRUMP_DAYS <- as.numeric(difftime(as.Date('2025-01-19'), as.Date('2023-09-01')))
+```
+
+
+## Load data
+```{r}
+arrests <- read_feather(paste0(INPUT_FP, 'arrests.feather'))
+detainers <- read_feather(paste0(INPUT_FP, 'detainers.feather'))
+detentions <- read_feather(paste0(INPUT_FP, 'detentions.feather'))
+detentions_short <- read_feather(paste0(INPUT_FP, 'detentions_short.feather'))
+
+facilities <- read.csv('../../../data/input/ICE facilities/facilities.csv')
+```
+
+## Simple pivot tables
+### Arrests x AOR
+```{r}
+# arrests before and after Trump by month
+arrests_pre_post_Trump <- arrests %>%
+  group_by(arrests_after_Trump) %>%
+  count() %>%
+  mutate(monthly_arrests = ifelse(arrests_after_Trump == 0, n/PRE_TRUMP_DAYS*30, n/POST_TRUMP_DAYS*30))
+
+write.csv(arrests_pre_post_Trump, paste0(OUTPUT_FP, 'arrests_pre_post_Trump.csv'))
+
+# arrests by AOR before and after Trump by month
+arrests_aor_pre_post_Trump <- arrests %>%
+  group_by(arrests_after_Trump, arrests_apprehension_aor) %>%
+  count() %>%
+  mutate(monthly_arrests = ifelse(arrests_after_Trump == 0, n/PRE_TRUMP_DAYS*30, n/POST_TRUMP_DAYS*30)) %>%
+  group_by(arrests_apprehension_aor) %>% 
+  mutate(sum_arrests = sum(n)) %>%
+  ungroup() %>%
+  arrange(desc(sum_arrests)) %>%
+  mutate(arrests_after_Trump = factor(ifelse(arrests_after_Trump == 0, 'before Trump', 'after Trump'), levels = c('before Trump', 'after Trump')),
+         AOR = str_replace(arrests_apprehension_aor, ' Area of Responsibility', ''))
+
+write.csv(arrests_aor_pre_post_Trump, paste0(OUTPUT_FP, 'arrests_aor_pre_post_Trump.csv'))
+  
+# plot top AORs
+arrests_aor_pre_post_Trump %>%
+  arrange(desc(sum_arrests)) %>%
+  head(n = 10) %>%
+  ggplot(aes(x = AOR, y = monthly_arrests, fill = arrests_after_Trump))+
+  geom_bar(stat = 'identity', position = position_dodge())+
+  scale_fill_manual(values = c("before Trump" = "darkgrey", "after Trump" = "lightgrey")) +
+  theme_bw()+
+  labs(x = '', y = 'monthly arrests', fill = '',
+       title = 'Monthly ICE arrests by Area of Operation',
+       subtitle = 'Top five AORs included only')
+
+ggsave(paste0(OUTPUT_FP, 'arrests_aor_pre_post_Trump.png'), width = 8, height = 6)
+```
+
+## criminal records by type of arrest
+The arrests dataset contains information on arrest method whereas the detentions dataset provides better information on criminality. We thus use a left join, merging the arrest dataset onto the detentions dataset. Where no arrest matches, excluding cases of flaws in the data, we can infer that the person was not arrested through ERO. Many of those arrested through other means end up in detention through CBP or HSI (as indicated by the final_program column).
+### set up DF
+```{r}
+# arrests do not always precede detention. Sometimes the gap is a few hours, sometimes several days even if the the arrest-detention
+# sequence is the same. seven days appeared to give a good balance between Type I and Type II errors, 
+# but I only checked anecdotally.
+time_window <- as.difftime(7, units = "days")
+
+# select relevant variables for criminality analysis from the arrests dataset
+arrests_restr <- arrests %>%
+    dplyr::select(arrests_unique_identifier, arrests_apprehension_date, arrests_apprehension_method, arrests_apprehension_state) %>%
+    # create arrest interval start and end date based on the time window variable.
+    mutate(a_start = arrests_apprehension_date - time_window,
+           a_end = arrests_apprehension_date + time_window) %>%
+    distinct() %>% 
+    filter(!is.na(arrests_unique_identifier)) # remove NAs to prevent many-to-many matches
+
+# we merge on overlapping intervals, so we need to define a detention interval (that is an atom)
+detentions_short2 <- detentions_short %>%
+  ungroup() %>%
+  mutate(detentions_rownumber = row_number(),
+         d_start = detentions_book_in_date_time,
+         d_end = detentions_book_in_date_time)
+
+# convert to data table for faster matches
+setDT(detentions_short2)
+setDT(arrests_restr)
+
+# prep for merge
+setkey(detentions_short2, detentions_unique_identifier, d_start, d_end)
+setkey(arrests_restr, arrests_unique_identifier, a_start,  a_end)
+
+# merge based on overlapping intervals. matches directly on ID AND if x interval is contained in the y interval
+m <- foverlaps(detentions_short2, arrests_restr,
+               by.x = c("detentions_unique_identifier", "d_start", "d_end"),
+               by.y = c("arrests_unique_identifier", "a_start", "a_end"),
+               type = "within",
+               nomatch = NA)
+
+# remove duplicates in case multuple matches remain
+setorder(m, detentions_rownumber, -arrests_apprehension_date)
+detentions_short_arrest_method <- m[, .SD[1], by = detentions_rownumber] %>%
+  as.data.frame() %>%
+  # set up different arrest types
+  mutate(apprehension_method_restr = case_when(arrests_apprehension_method %in% c('Non-Custodial Arrest', 'Located') ~ 'likely community arrest',
+                                               !is.na(arrests_apprehension_method) ~ 'other ERO arrest',
+                                               TRUE ~ 'non ERO arrest'))
+```
+
+### Unmatched arrests and detentions
+Using 'arrests_not_matched_in_detention', I tried to check whether unmatched arrests had likely counterparts in detentions to decide on the time window.
+```{r}
+# detention IDs matched to arrest ID
+matched_arrest_ids <- detentions_short_arrest_method[!is.na(detentions_short_arrest_method$arrests_apprehension_method),]$detentions_unique_identifier
+
+# arrest IDs not matched to a detention ID
+arrests_not_matched <- arrests %>% 
+  filter(!(arrests_unique_identifier %in% matched_arrest_ids))
+
+# check which unmatched arrest IDs show up in the detentions dataset
+arrests_not_matched_in_detention <- arrests_not_matched %>%
+  filter(arrests_unique_identifier %in% detentions_short_arrest_method$detentions_unique_identifier)
+
+#check apprehension method
+table(arrests_not_matched_in_detention$arrests_apprehension_method, useNA = 'always')
+```
+
+### analyze criminal background by arrest method
+```{r}
+# breakdown threat level x trump
+criminality_trump <- detentions_short_arrest_method %>%
+  group_by(detentions_after_Trump, detentions_case_threat_level) %>%
+  count() %>%
+  group_by(detentions_after_Trump) %>%
+  mutate(share = n/sum(n)) %>%
+  ungroup()
+
+write.csv(criminality_trump, paste0(OUTPUT_FP, 'threat_trump.csv'))
+
+# breakdown CBP arrest x trump
+cbp_trump <- detentions_short_arrest_method %>%
+  mutate(is_CBP = detentions_short_arrest_method$detentions_final_program == 'Border Patrol') %>%
+  group_by(is_CBP, detentions_after_Trump) %>%
+  count() %>%
+  group_by(detentions_after_Trump) %>%
+  mutate(share = n/sum(n)) %>%
+  ungroup()
+
+write.csv(cbp_trump, paste0(OUTPUT_FP, 'cbp_trump.csv'))
+
+# CBP arrests by threat level
+cbp_threat <- detentions_short_arrest_method %>%
+  mutate(is_CBP = detentions_short_arrest_method$detentions_final_program == 'Border Patrol') %>%
+  filter(is_CBP == T) %>%
+  group_by(detentions_case_threat_level) %>%
+  count() %>%
+  ungroup() %>%
+  mutate(share = n / sum(n))
+  
+write.csv(cbp_threat, paste0(OUTPUT_FP, 'cbp_only_threat.csv'))
+
+# Breakdown appr. method x threat level x Trump
+criminality_source_arrest_national <- detentions_short_arrest_method %>%
+  group_by(detentions_after_Trump, apprehension_method_restr, detentions_case_threat_level) %>%
+  count() %>%
+  group_by(detentions_after_Trump, apprehension_method_restr) %>%
+  mutate(threat_share = 100*n/sum(n, na.rm = T),
+         geo = 'national') %>%
+  ungroup()
+
+# Breakdown appr. method x threat level x Trump, TN only
+criminality_source_arrest_TN <- detentions_short_arrest_method %>%
+  filter(arrests_apprehension_state == 'TENNESSEE') %>%
+  group_by(detentions_after_Trump, apprehension_method_restr, detentions_case_threat_level) %>%
+  count() %>%
+  group_by(detentions_after_Trump, apprehension_method_restr) %>%
+  mutate(threat_share = 100*n/sum(n, na.rm = T),
+         geo = 'Tennessee') %>%
+  ungroup()
+
+# combine national and TN dfs
+criminality_source_arrest_comb <- criminality_source_arrest_national %>%
+  bind_rows(criminality_source_arrest_TN) %>%
+  mutate(detentions_after_Trump = ifelse(detentions_after_Trump == 1, 'after Trump', 'before Trump'),
+         detentions_after_Trump = factor(detentions_after_Trump, c('before Trump', 'after Trump')),
+         apprehension_method_restr = factor(apprehension_method_restr, c('likely community arrest', 'other ERO arrest', 'non ERO arrest')),
+         detentions_case_threat_level = case_when(detentions_case_threat_level == 1 ~ 'aggravated felon',
+                                                  detentions_case_threat_level == 2 ~ 'felony/repeated misd.',
+                                                  detentions_case_threat_level == 3 ~ 'minor crime',
+                                                  TRUE ~ 'no criminal record'))
+  
+# plot threat levels rates by appr method and trump
+ggplot(criminality_source_arrest_comb, aes(x = detentions_case_threat_level, y = threat_share, fill = detentions_after_Trump))+
+  geom_bar(stat = 'identity', position = position_dodge())+
+  facet_grid(geo~ apprehension_method_restr)+
+  scale_fill_manual(values = c("after Trump" = "red", "before Trump" = "blue"))+
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1))+
+  labs(x = '', y = '% detainees', title = 'ICE detainees by arrest type and criminal background',
+       fill = '')
+
+write.csv(criminality_source_arrest_comb, paste0(OUTPUT_FP, 'appr_method_threat_trump.csv'))
+
+
+# examples of common charges by threat level
+table(detentions_short[detentions_short$detentions_case_threat_level ==2,]$detentions_msc_charge)
+table(detentions_short[detentions_short$detentions_case_threat_level ==3,]$detentions_msc_charge)
+```
+
+
+### Arrest rates during spikes in deployment
+```{r}
+# State level: identify spikes on the monthly level
+detentions_spikes_state_month <- detentions_short_arrest_method %>%
+  # filter to only focus on community arrests
+  filter(apprehension_method_restr == 'likely community arrest') %>%
+  # one hot encode threat levels
+  mutate(detention_book_in_month = as.Date(detention_book_in_month),
+         level_1_criminal = ifelse(detentions_case_threat_level == 1, 1, 0),
+         level_2_criminal = ifelse(detentions_case_threat_level == 2, 1, 0),
+         level_3_criminal = ifelse(detentions_case_threat_level == 3, 1, 0),
+         is_tps  = ifelse(detentions_citizenship_country %in% c('VENEZUELA', 'AFGHANISTAN', 'CUBA', 'UKRAINE'), 1, 0)) %>%
+  # count number of arrests by threat level, state, month, and Trump
+  group_by(detention_book_in_month, detentions_after_Trump, arrests_apprehension_state) %>%
+  summarise(n = n(),
+            level_1 = sum(level_1_criminal, na.rm = T),
+            level_2 = sum(level_2_criminal, na.rm = T),
+            level_3 = sum(level_3_criminal, na.rm = T),
+            tps = sum(is_tps, na.rm = T)
+            ) %>%
+  filter(detention_book_in_month > as.Date("2023-09-30")) %>%
+  # compute shares of arrests by threat level, state, month, and Trump
+  mutate(level_1_share = 100*level_1/n,
+         level_2_share = 100*level_2/n,
+         level_3_share = 100*level_3/n,
+         combined_crim = level_1_share + level_2_share + level_3_share,
+         tps_share = tps/n,
+         after_Trump = ifelse(detentions_after_Trump == 0, 'before Trump', 'after Trump'),
+         after_Trump = factor(as.factor(after_Trump), levels = c('before Trump', 'after Trump'))
+         ) %>%
+  # compute monthly arrest z scores by state and and before/after Trump
+  group_by(detentions_after_Trump, arrests_apprehension_state) %>%
+  mutate(period_state_z = (n - mean(n, na.rm = TRUE)) / sd(n, na.rm = TRUE),
+         spike = ifelse(period_state_z > 1.5 & n > 150, 1, 0)) %>%
+  ungroup()
+
+write.csv(detentions_spikes_state_month, paste0(OUTPUT_FP, 'detentions_spikes_state_month.csv'))
+
+# plot agg. felons v state z-score
+detentions_spikes_state_month %>%
+  filter(n > 50) %>%
+  ggplot(aes(x = period_state_z, y = level_1_share))+
+  facet_wrap(.~ after_Trump)+
+  geom_point()+
+  geom_smooth(method = "lm", se = TRUE)+
+  labs(x = 'z-score (number of monthly community arrests)', y = '% aggravated felons',
+       title = 'Share of aggravated felons arrested declines during surges under Trump')+
+  theme_bw()
+
+ggsave(paste0(OUTPUT_FP, 'threat1_detention_spikes_month.png'), width = 8, height = 6)
+
+# plot other conviction status
+detentions_spikes_state_month %>%
+  filter(n > 50) %>%
+  ggplot(aes(x = period_state_z, y = level_2_share))+
+  geom_point()+
+  facet_wrap(.~ after_Trump)+
+  geom_smooth(method = "lm", se = TRUE)+
+  theme_bw()
+
+detentions_spikes_state_month %>%
+  filter(n > 50) %>%
+  ggplot(aes(x = period_state_z, y = level_3_share))+
+  geom_point()+
+  facet_wrap(.~ after_Trump)+
+  geom_smooth(method = "lm", se = TRUE)+
+  theme_bw()
+
+# plot all threat levels combined
+detentions_spikes_state_month %>%
+  filter(n > 50) %>%
+  ggplot(aes(x = period_state_z, y = combined_crim))+
+  geom_point()+
+  facet_wrap(.~ after_Trump)+
+  geom_smooth(method = "lm", se = TRUE)+
+  theme_bw()
+
+# plot TPS
+detentions_spikes_state_month %>%
+  filter(n > 50) %>%
+  ggplot(aes(x = period_state_z, y = tps_share))+
+  geom_point()+
+  facet_wrap(.~ after_Trump)+
+  geom_smooth(method = "lm", se = TRUE)+
+  theme_bw()
+
+# regression analysis
+fit_lev1_spike <- lm(level_1_share ~ period_state_z * after_Trump, data = detentions_spikes_state_month)
+summary(fit_lev1_spike)
+
+# controlling for number of state-month arrests
+fit_lev1_spike_n <- lm(level_1_share ~ period_state_z * after_Trump + n, data = detentions_spikes_state_month)
+summary(fit_lev1_spike_n)
+```
+
+## Top detainer and detention facilities
+```{r}
+OUTPUT_FP_FACILITIES <- paste0(OUTPUT_FP, 'facilities/')
+dir.create(OUTPUT_FP_FACILITIES, showWarnings = F)
+
+### detainers ###
+# add variable for when detainer resulted in detention
+detainers <- detainers %>%
+  mutate(in_detention = case_when(detainers_detainer_lift_reason == 'Booked into Detention' ~ 'detained', 
+                                  .default = 'not_detained'))
+
+# detainers x facility x resulted in detention
+top_detainers_before_after <- detainers %>%
+  group_by(detainers_after_Trump, detainers_detention_facility, detainers_detention_facility_code, detainers_facility_state, detainers_facility_city, in_detention) %>%
+  count() %>%
+  mutate(detainers_after_Trump = ifelse(detainers_after_Trump == 1, 'after_Trump', 'before_Trump')) %>%
+  pivot_wider(names_from = c(detainers_after_Trump, in_detention), values_from = n) %>%
+   dplyr::select(-ends_with('NA')) %>%
+   mutate(before_Trump_detention_percentage = 100*before_Trump_detained/(before_Trump_detained + before_Trump_not_detained),
+          after_Trump_detention_percentage = 100*after_Trump_detained/(after_Trump_detained + after_Trump_not_detained),
+          difference_detention_percentage = after_Trump_detention_percentage - before_Trump_detention_percentage,
+          before_Trump_monthly_honored_detainers = 30*(before_Trump_detained/PRE_TRUMP_DAYS),
+          after_Trump_monthly_honored_detainers = 30*(after_Trump_detained/POST_TRUMP_DAYS),
+          difference_monthly_honored_detainers = after_Trump_monthly_honored_detainers - before_Trump_monthly_honored_detainers,
+          mult_factor_monthly_honored_detainers = after_Trump_monthly_honored_detainers/before_Trump_monthly_honored_detainers)
+
+
+# breakdown by specific crimes
+detainers_spec_crimes_post_Trump <- detainers %>%
+  filter(detainers_after_Trump == 1, in_detention == 'detained') %>%
+  mutate(crime_type = case_when(detainers_most_serious_conviction_msc_charge %in% c("Driving Under Influence Drugs", "Driving Under Influence Liquor", 'Traffic Offense') ~ 'crime_type_traffic',
+                                detainers_most_serious_conviction_msc_charge %in% c("Illegal Entry (INA SEC.101(a)(43)(O), 8USC1325 only)", "Illegal Re-Entry (INA SEC.101(a)(43)(O), 8USC1326 only)") ~ 'crime_type_immigration',
+                                is.na(detainers_most_serious_conviction_msc_charge) ~ 'crime_type_no_crime',
+                                TRUE ~ 'other_crime')) %>%
+  group_by(detainers_detention_facility_code, crime_type) %>%
+  count() %>%
+  pivot_wider(names_from = crime_type, values_from = n)
+  
+# breakdown by citizenship
+detainers_citizenship_post_Trump <- detainers %>%
+  mutate(tp_nationalities = case_when(detainers_citizenship_country %in% c('VENEZUELA', 'AFGHANISTAN', 'CUBA', 'UKRAINE') ~ 'TP_nationality',
+                                      .default = 'other_nationality')) %>%
+  filter(detainers_after_Trump == 1, in_detention == 'detained') %>%
+  group_by(detainers_detention_facility_code, tp_nationalities) %>%
+  count() %>%
+    pivot_wider(names_from = tp_nationalities, values_from = n)
+
+# construct master sheet
+detainer_fac_master_df <- top_detainers_before_after %>%
+  left_join(detainers_spec_crimes_post_Trump,  by = 'detainers_detention_facility_code') %>%
+  left_join(detainers_citizenship_post_Trump,  by = 'detainers_detention_facility_code') %>%
+  mutate(crime_type_traffic_percentage = 100*crime_type_traffic/after_Trump_detained,
+         crime_type_immigration_percentage = 100*crime_type_immigration/after_Trump_detained,
+         TP_nationality_percentage = 100*TP_nationality/after_Trump_detained)
+
+write.xlsx(detainer_fac_master_df, paste0(OUTPUT_FP_FACILITIES, 'detainer_facility_master.xlsx'), overwrite = T)
+
+### detention facilites ###
+top_first_detentions_before_after <- detentions_short %>%
+  group_by(detentions_after_Trump, detentions_detention_facility, detentions_detention_facility_code) %>%
+  count() %>%
+  mutate(detentions_after_Trump = ifelse(detentions_after_Trump == 1, 'after_Trump', 'before_Trump')) %>%
+  pivot_wider(names_from = detentions_after_Trump, values_from = n) %>%
+  mutate(before_Trump_monthly_first_detensions = 30*(before_Trump/PRE_TRUMP_DAYS),
+          after_Trump_monthly_first_detentions = 30*(after_Trump/POST_TRUMP_DAYS),
+          difference_monthly_first_detensions = after_Trump_monthly_first_detentions - before_Trump_monthly_first_detensions,
+          mult_monthly_first_detensions = after_Trump_monthly_first_detentions/before_Trump_monthly_first_detensions) 
+
+detentions_final_programs_before_after <- detentions_short %>%
+  mutate(detentions_after_Trump = ifelse(detentions_after_Trump == 1, 'after_Trump', 'before_Trump'),
+         #TODO need to check that these groupings still work
+         detentions_final_program_restricted = case_when(detentions_final_program %in% c('287G Program', '287g Task Force') ~ '287g',
+                                                         detentions_final_program %in% c('Alternatives to Detention') ~ 'alt_detentions',
+                                                         detentions_final_program %in% c('Border Patrol') ~ 'CBP',
+                                                         detentions_final_program %in% c('Detained Docket Control') ~ 'detained_docket',
+                                                         detentions_final_program %in% c('ERO Criminal Alien Program', 'ERO Criminal Prosecutions') ~ 'ERO',
+                                                         detentions_final_program %in% c('Homeland Security Investigations', 'HSI Criminal Arrest Only') ~ 'HSI',
+                                                         detentions_final_program %in% c('Inspections - Air', 'Inspections - Land', 'Inspections - Sea') ~ 'Inspections',
+                                                         detentions_final_program %in% c('Non-Detained Docket Control') ~ 'non_detained_docket',
+                                                         detentions_final_program %in% c('Fugitive Operations') ~ 'fugitive_ops',
+                                                         .default = NA)) %>%
+  group_by(detentions_detention_facility_code, detentions_after_Trump, detentions_final_program_restricted) %>%
+  count() %>%
+  ungroup() %>%
+  mutate(n = case_when(detentions_after_Trump == 'after_Trump' ~ 30*n/POST_TRUMP_DAYS,
+                       detentions_after_Trump == 'before_Trump' ~ 30*n/PRE_TRUMP_DAYS,
+                       .default = NA)) %>%
+  pivot_wider(names_from = c(detentions_after_Trump), values_from = n) %>%
+  mutate(difference =  after_Trump - before_Trump) %>%
+  pivot_wider(id_cols = detentions_detention_facility_code, 
+              names_from = detentions_final_program_restricted, values_from = c(before_Trump, after_Trump, difference),
+              names_prefix = 'fp_month_')
+
+detentions_crime_type_after = detentions_short %>%
+  mutate(crime_type = case_when(detentions_msc_charge %in% c("Driving Under Influence Drugs", "Driving Under Influence Liquor", "Traffic Offense") ~ 'crime_type_traffic',
+                                detentions_msc_charge %in% c("Illegal Entry (INA SEC.101(a)(43)(O), 8USC1325 only)", "Illegal Re-Entry (INA SEC.101(a)(43)(O), 8USC1326 only)") ~ 'crime_type_immigration',
+                                is.na(detentions_msc_charge) ~ 'crime_type_no_crime',
+                                .default = 'other_crime')) %>%
+  filter(detentions_after_Trump == 1) %>%
+  group_by(detentions_detention_facility_code, crime_type) %>%
+  count() %>%
+  pivot_wider(names_from = crime_type, values_from = n)
+
+detentions_citizenship_after <- detentions_short %>%
+  mutate(tp_nationalities = case_when(detentions_citizenship_country %in% c('VENEZUELA', 'AFGHANISTAN', 'CUBA', 'UKRAINE') ~ 'TP_nationality',
+                                      .default = 'other_nationality')) %>%
+  filter(detentions_after_Trump == 1) %>%
+  group_by(detentions_detention_facility_code, tp_nationalities) %>%
+  count() %>%
+  pivot_wider(names_from = tp_nationalities, values_from = n)
+
+
+detentions_fac_master <- top_first_detentions_before_after %>%
+  left_join(detentions_final_programs_before_after, by = 'detentions_detention_facility_code') %>%
+  left_join(detentions_crime_type_after, by = 'detentions_detention_facility_code') %>%
+  left_join(detentions_citizenship_after, by = 'detentions_detention_facility_code')
+
+write.xlsx(detentions_fac_master, paste0(OUTPUT_FP_FACILITIES, 'detentions_facility_master.xlsx'), overwrite = T)
+```
+
+
+
+## 287 G
+```{r}
+# monthly 287 G counts and shares for detainers and detentions
+arrests_287_month <- arrests %>%
+  group_by(arrests_apprehension_month) %>%
+  summarise(share_287 = mean(arrests_apprehension_is_287, na.rm = T),
+            sum_287 = sum(arrests_apprehension_is_287, na.rm = T))
+
+detentions_287_month <- detentions_short %>%
+  group_by(detention_book_in_month) %>%
+  summarise(share_287 = mean(detention_is_287, na.rm = T),
+            sum_287 = sum(detention_is_287, na.rm = T))
+
+
+# visualize stats
+ggplot(detentions_287_month, aes(x = detention_book_in_month, y = sum_287))+
+  geom_point()+
+  geom_vline(xintercept = as.POSIXct('2025-01-20'), color = 'red')+
+  labs(x = '', y = '287G count',
+       title = 'Detentions:287G count/month')+
+  theme_bw()+
+  xlim(as.POSIXct('2023-09-01'), as.POSIXct('2025-10-15'))
+
+ggplot(detentions_287_month, aes(x = detention_book_in_month, y = share_287))+
+  geom_point()+
+  geom_vline(xintercept = as.POSIXct('2025-01-20'), color = 'red')+
+  labs(x = '', y = '287G count',
+       title = 'Detentions:287G Share/month')+
+  theme_bw()+
+  xlim(as.POSIXct('2023-09-01'), as.POSIXct('2025-10-15'))
+
+ggplot(arrests_287_month, aes(x = arrests_apprehension_month, y = sum_287))+
+  geom_point()+
+  geom_vline(xintercept = as.POSIXct('2025-01-20'), color = 'red')+
+  labs(x = '', y = '287G count',
+       title = 'arrests:287G count/month')+
+  theme_bw()+
+  xlim(as.POSIXct('2023-09-01'), as.POSIXct('2025-10-15'))
+
+ggplot(arrests_287_month, aes(x = arrests_apprehension_month, y = share_287))+
+  geom_point()+
+  geom_vline(xintercept = as.POSIXct('2025-01-20'), color = 'red')+
+  labs(x = '', y = '287G count',
+       title = 'Arrests: 287G Share/month')+
+  theme_bw()+
+  xlim(as.POSIXct('2023-09-01'), as.POSIXct('2025-10-15'))
+
+# state distribution for 287g
+arrests_287g_state <- arrests %>%
+  group_by(arrests_apprehension_month,arrests_apprehension_is_287, arrests_apprehension_state) %>%
+  count() %>%
+  group_by(arrests_apprehension_month, arrests_apprehension_state) %>%
+  mutate(share_month_state = n/sum(n)) %>%
+  ungroup() %>%
+  group_by(arrests_apprehension_month, arrests_apprehension_is_287) %>%
+  mutate(share_month_287g = n/sum(n)) %>%
+  ungroup()
+
+write.csv(arrests_287g_state, paste0(OUTPUT_FP, 'arrests_287g_state.csv'))
+
+# criminality
+arrests_287g_criminality <- arrests %>%
+  group_by(arrests_after_Trump, arrests_apprehension_is_287, arrests_apprehension_criminality) %>%
+  count() %>%
+  group_by(arrests_after_Trump, arrests_apprehension_is_287) %>%
+  mutate(share = n/sum(n)) %>%
+  ungroup()
+
+write.csv(arrests_287g_criminality, paste0(OUTPUT_FP, 'arrests_287g_criminality.csv'))
+
+detentions_287g_criminality <- detentions_short %>%
+  #filter(detentions_unique_identifier %in% arrests[arrests$arrests_apprehension_is_287 == T,]$arrests_unique_identifier) %>%
+  group_by(detentions_after_Trump, detentions_case_threat_level, detention_is_287) %>%
+  count() %>%
+  group_by(detentions_after_Trump, detention_is_287) %>%
+  mutate(share = n/sum(n)) %>%
+  ungroup()
+
+write.csv(detentions_287g_criminality, paste0(OUTPUT_FP, 'detentions_287g_criminality.csv'))
+
+```
+
+
+
+
+## Explore Risk scores
+Explore correspondence between threat level and MSC
+```{r}
+threat_by_charge <- detentions_short %>%
+  group_by(detentions_after_Trump, detentions_msc_charge, detentions_case_threat_level) %>%
+  count() %>%
+  pivot_wider(names_from = detentions_case_threat_level, values_from = n, names_prefix = 'threat_') %>%
+  dplyr::select(detentions_msc_charge, detentions_after_Trump, threat_1, threat_2, threat_3, threat_NA)
+
+threat_by_charge %>% head(20)
+
+write.csv(threat_by_charge, paste0(OUTPUT_FP, 'threat_level_msc.csv'))
+```
+
+
+
+
+
+
+
+

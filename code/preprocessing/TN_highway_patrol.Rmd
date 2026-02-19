@@ -1,0 +1,96 @@
+---
+title: "OCR TN Highway Patrol"
+author: "Justin Braun"
+date: "2025-11-13"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Load libraries
+```{r}
+library(dplyr)
+library(ggplot2)
+library(stringr)
+library(purrr)
+library(janitor)
+library(lubridate)
+library(tidygeocoder)
+library(tidyr)
+library(readxl)
+```
+
+## Global vars
+```{r}
+INPUT_FP <- '../../data/input/TN Highway Patrol/'
+INTERMEDIARY_FP <- '../../data/intermediate/TN Highway Patrol/'
+```
+
+## Load data
+```{r}
+pr <- read.csv(paste0(INPUT_FP, 'pinpoint_ocr_v4.csv'))
+page_numbers <- read_xlsx(paste0(INPUT_FP, 'HP_page_numbers.xlsx')) %>%
+  rename(start_page = Start,
+         end_page = End)%>% 
+  mutate(EVENT = as.character(EVENT))
+```
+
+
+## Clean data
+```{r}
+pr_clean_short <- pr %>%
+  janitor::clean_names() %>%
+  filter(police_event_information_date_time_received != '') %>%
+  group_by(event) %>%
+  slice_sample(n = 1) %>%
+  ungroup() %>%
+  mutate(
+    # convert date/times into proper format
+    across(contains("date"), ~ mdy_hms(.)),
+    # clean location information
+    location_clean = str_replace(police_event_information_location, "\\s*\\(VERIFIED\\)", ""),
+    primary_unit_extracted = str_extract(primary_unit, '(?<=\\d{2}/\\d{2}/)\\d{2}'),
+    event_log_combined = paste0(event_log, '\n', event_log_pg_3_of_3),
+    event = str_extract(file_name, "\\d+(?=\\.pdf$)")) %>%
+  #geocode addresses
+  geocode(address = location_clean, method = 'google')
+  
+
+extract_events <- function(txt) {
+  
+  # extract timestamps
+  times <- str_extract_all(txt, "\\b\\d{2}:\\d{2}:\\d{2}\\b")[[1]]
+  
+  # split text around timestamps
+  pieces <- str_split(txt, "\\b\\d{2}:\\d{2}:\\d{2}\\b")[[1]]
+  
+  # clean whitespace
+  pieces <- str_squish(pieces)
+  
+  # return tibble
+  tibble(
+    text_before_time = pieces[1:length(times)],
+    event_time_stamp = times
+  )
+}
+
+
+pr_clean_long_events <- pr_clean_short %>%
+  rowwise() %>%
+  mutate(events = list(extract_events(event_log_combined))) %>%
+  ungroup() %>%
+  unnest(events)
+```
+
+## Save
+```{r}
+write.csv(pr_clean_short, paste0(INTERMEDIARY_FP, 'pr_short.csv'))
+
+pr_clean_short %>%
+  dplyr::select(police_event_information_date_time_received, long, lat) %>%
+  write.csv(paste0(INTERMEDIARY_FP, 'pr_gmaps.csv'))
+write.csv(pr_clean_long_events, paste0(INTERMEDIARY_FP, 'pr_long_events.csv'))
+```
+

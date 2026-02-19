@@ -1,0 +1,105 @@
+---
+title: "TN Highway Patrol"
+author: "Justin Braun"
+date: "2025-12-23"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Set Global Variables
+```{r}
+INPUT_FP <- '../../data/intermediate/TN Highway Patrol/'
+OUTPUT_FP <- '../../data/results/TN Highway Patrol/'
+
+dir.create(OUTPUT_FP, showWarnings = F)
+```
+
+## Load libraries
+```{r}
+library(dplyr)
+library(ggplot2)
+library(stringr)
+library(purrr)
+library(janitor)
+library(lubridate)
+library(sf)
+library(leaflet)
+library(leaflet.extras2)
+library(yyjsonr)
+library(htmlwidgets)
+```
+
+
+## Load data
+```{r}
+pr_short <- read.csv(paste0(INPUT_FP, 'pr_short.csv'))
+pr_long <- read.csv(paste0(INPUT_FP, 'pr_long_events.csv'))
+```
+
+
+
+## Display Unit's movement
+```{r}
+
+for(cur_unit_id in unique(pr_short$primary_unit_extracted)){
+  pr_short_cur_unit <- pr_short %>%
+    filter(primary_unit_extracted == cur_unit_id) %>%
+    mutate(
+      police_event_information_date_time_initiated =
+        as.POSIXct(police_event_information_date_time_initiated, tz = "UTC")
+    ) %>%
+    filter(!is.na(long)) %>%
+    st_as_sf(coords = c("long", "lat"), crs = 4326, remove = FALSE)
+  
+  if(nrow(pr_short_cur_unit) < 10) next
+  # Define HTML with advanced CSS styling
+title_1 <- "
+<style>
+  .custom-title \\{
+    color: #34495e;
+    text-shadow: 2px 2px 4px rgba(0, 0, 0, 0.2);
+    box-shadow: 0 4px 8px rgba(0, 0, 0, 0.5);
+    background-color: rgba(204, 224, 255, 0.9);
+    padding: 12px;
+    border-radius: 8px;
+    transition: background-color 0.3s, box-shadow 0.3s;
+\\}
+.custom-title:hover \\{
+    background-color: rgba(204, 224, 255, 0.7);
+    box-shadow: 0 4px 8px rgba(0, 0, 0, 0.3);
+\\}
+</style>
+<h1>
+  Unit: "
+  
+  title_2 <-"
+</h1>"
+  title <- paste0(title_1, cur_unit_id, title_2)
+
+wid <- leaflet(pr_short_cur_unit) %>%
+  addProviderTiles(providers$CartoDB.Positron) %>%
+  addControl(html = title, position = "topright", className = "custom-title") %>%
+  addTimeslider(
+    data = pr_short_cur_unit,
+    radius = 4,
+    color = "red",
+    options = timesliderOptions(
+      position = "topright",
+      timeAttribute = "police_event_information_date_time_initiated",
+      range = TRUE,
+      showAllOnStart = FALSE
+    )
+  )
+
+  saveWidget(
+    wid,
+    file = paste0(OUTPUT_FP, "pr_short_unit_", cur_unit_id, ".html")
+  )
+}
+
+```
+
+
